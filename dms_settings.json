@@ -1,0 +1,14 @@
+{
+    "azure_maps_key": "apiKeyNhiHai",
+    "auto_start": false,
+    "auto_save": true,
+    "sound_alerts": true,
+    "response_time": 10,
+    "auto_call": false,
+    "sensitivity": 0.7,
+    "fps": 30,
+    "drowsiness_detection": true,
+    "yawn_detection": true,
+    "head_pose_analysis": true,
+    "microsleep_detection": true
+}

@@ -1,0 +1,11 @@
+{
+  "timestamp": "2025-06-07T15:29:28.222555",
+  "duration": 30,
+  "ear_threshold": 0.15,
+  "mar_threshold": 0.36531501856826476,
+  "baseline_ear": 0.2375289015518473,
+  "baseline_mar": 0.35489269168895393,
+  "ear_std": 0.07882833776518595,
+  "mar_std": 0.005211163439655422,
+  "sample_count": 847
+}

@@ -1,0 +1,675 @@
+import cv2
+import numpy as np
+import time
+import threading
+from collections import deque
+from datetime import datetime
+import json
+import logging
+from dataclasses import dataclass
+from typing import Tuple, List, Optional
+from scipy.spatial import distance as dist
+import mediapipe as mp
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
+
+@dataclass
+class DriverState:
+    consciousness_level: str
+    confidence: float
+    eye_aspect_ratio: float
+    mouth_aspect_ratio: float
+    head_pose: Tuple[float, float, float]
+    blink_rate: float
+    yawn_detected: bool
+    microsleep_detected: bool
+    timestamp: datetime
+
+class DriverMonitoringSystem:
+    def __init__(self, camera_id=0):
+
+        self.last_alert_time = 0
+        self.ALERT_COOLDOWN = 5  # 5 seconds between alerts
+        """
+        Comprehensive Driver Monitoring System using MediaPipe (NO DLIB REQUIRED!)
+        
+        Args:
+            camera_id: Camera device ID (0 for default webcam)
+        """
+        # Initialize camera
+        self.cap = cv2.VideoCapture(camera_id)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        # Initialize MediaPipe Face Mesh (replaces dlib)
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_drawing_styles = mp.solutions.drawing_styles
+        
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5
+        )
+        
+        # MediaPipe Face Detection for backup
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detection = self.mp_face_detection.FaceDetection(
+            model_selection=1, min_detection_confidence=0.7
+        )
+        
+        # Eye landmark indices for MediaPipe (468 face landmarks)
+        self.LEFT_EYE_LANDMARKS = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+        self.RIGHT_EYE_LANDMARKS = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+        self.MOUTH_LANDMARKS = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 91]
+        
+        # Simplified eye and mouth points for easier calculation
+        self.LEFT_EYE_POINTS = [33, 160, 158, 133, 153, 144]  # Key eye landmarks
+        self.RIGHT_EYE_POINTS = [362, 385, 387, 263, 373, 380]  # Key eye landmarks
+        self.MOUTH_POINTS = [78, 81, 13, 311, 308, 415, 310, 317, 14, 87]  # Key mouth landmarks
+        
+        # FIXED THRESHOLDS - More reasonable values
+        self.EYE_AR_THRESH = 0.2  # Lowered threshold
+        self.EYE_AR_CONSEC_FRAMES = 15  # Increased frames needed
+        self.MOUTH_AR_THRESH = 0.7  # Increased threshold
+        self.YAWN_CONSEC_FRAMES = 20  # Increased frames needed
+        self.MICROSLEEP_THRESH = 3.0  # Increased time threshold
+        self.DROWSINESS_THRESH = 0.4  # More lenient threshold
+        
+        # State tracking variables
+        self.eye_counter = 0
+        self.yawn_counter = 0
+        self.blink_counter = 0
+        self.frame_counter = 0
+        self.start_time = time.time()
+        self.eyes_closed_start = None
+        
+        # Historical data for pattern analysis
+        self.ear_history = deque(maxlen=100)
+        self.mar_history = deque(maxlen=100)
+        self.head_pose_history = deque(maxlen=50)
+        self.consciousness_history = deque(maxlen=20)
+        
+        # Machine learning model
+        self.scaler = StandardScaler()
+        self.classifier = self._initialize_classifier()
+        
+        # Logging setup
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+        
+        # State tracking
+        self.current_state = DriverState(
+            consciousness_level="CONSCIOUS",
+            confidence=1.0,
+            eye_aspect_ratio=0.3,
+            mouth_aspect_ratio=0.3,
+            head_pose=(0, 0, 0),
+            blink_rate=15.0,
+            yawn_detected=False,
+            microsleep_detected=False,
+            timestamp=datetime.now()
+        )
+        
+        print("🚗 Driver Monitoring System initialized successfully!")
+        print("✅ Using MediaPipe - NO external model files needed!")
+        print("🎥 Camera ready for monitoring...")
+    
+    def _initialize_classifier(self):
+        """Initialize and return a machine learning classifier"""
+        return RandomForestClassifier(
+            n_estimators=100,
+            max_depth=10,
+            random_state=42,
+            class_weight='balanced'
+        )
+    
+    def calculate_eye_aspect_ratio_mediapipe(self, landmarks, eye_points, img_width, img_height):
+        """Calculate Eye Aspect Ratio using MediaPipe landmarks"""
+        # Convert normalized coordinates to pixel coordinates
+        eye_coords = []
+        for point_idx in eye_points:
+            if point_idx < len(landmarks):
+                x = int(landmarks[point_idx].x * img_width)
+                y = int(landmarks[point_idx].y * img_height)
+                eye_coords.append([x, y])
+        
+        if len(eye_coords) < 6:
+            return 0.3  # Default value
+        
+        # Calculate EAR using the 6 key points
+        # Vertical eye landmarks
+        A = dist.euclidean(eye_coords[1], eye_coords[5])
+        B = dist.euclidean(eye_coords[2], eye_coords[4])
+        # Horizontal eye landmark
+        C = dist.euclidean(eye_coords[0], eye_coords[3])
+        
+        # Calculate EAR
+        if C == 0:
+            return 0.3
+        ear = (A + B) / (2.0 * C)
+        return ear
+    
+    def calculate_mouth_aspect_ratio_mediapipe(self, landmarks, mouth_points, img_width, img_height):
+        """Calculate Mouth Aspect Ratio using MediaPipe landmarks"""
+        # Convert normalized coordinates to pixel coordinates
+        mouth_coords = []
+        for point_idx in mouth_points:
+            if point_idx < len(landmarks):
+                x = int(landmarks[point_idx].x * img_width)
+                y = int(landmarks[point_idx].y * img_height)
+                mouth_coords.append([x, y])
+        
+        if len(mouth_coords) < 6:
+            return 0.3  # Default value
+        
+        # Calculate MAR using key mouth points
+        # Vertical mouth landmarks
+        A = dist.euclidean(mouth_coords[1], mouth_coords[7])
+        B = dist.euclidean(mouth_coords[2], mouth_coords[6])
+        # Horizontal mouth landmark
+        C = dist.euclidean(mouth_coords[0], mouth_coords[4])
+        
+        # Calculate MAR
+        if C == 0:
+            return 0.3
+        mar = (A + B) / (2.0 * C)
+        return mar
+    
+    def estimate_head_pose_mediapipe(self, landmarks, img_width, img_height):
+        """Estimate head pose using MediaPipe face landmarks"""
+        # Key facial landmarks for pose estimation
+        nose_tip = [landmarks[1].x * img_width, landmarks[1].y * img_height, landmarks[1].z * img_width]
+        chin = [landmarks[175].x * img_width, landmarks[175].y * img_height, landmarks[175].z * img_width]
+        left_eye = [landmarks[33].x * img_width, landmarks[33].y * img_height, landmarks[33].z * img_width]
+        right_eye = [landmarks[362].x * img_width, landmarks[362].y * img_height, landmarks[362].z * img_width]
+        left_mouth = [landmarks[61].x * img_width, landmarks[61].y * img_height, landmarks[61].z * img_width]
+        right_mouth = [landmarks[291].x * img_width, landmarks[291].y * img_height, landmarks[291].z * img_width]
+        
+        # 3D model points (generic face model)
+        model_points = np.array([
+            (0.0, 0.0, 0.0),             # Nose tip
+            (0.0, -330.0, -65.0),        # Chin
+            (-225.0, 170.0, -135.0),     # Left eye
+            (225.0, 170.0, -135.0),      # Right eye
+            (-150.0, -150.0, -125.0),    # Left mouth corner
+            (150.0, -150.0, -125.0)      # Right mouth corner
+        ])
+        
+        # 2D image points
+        image_points = np.array([
+            nose_tip[:2],
+            chin[:2],
+            left_eye[:2],
+            right_eye[:2],
+            left_mouth[:2],
+            right_mouth[:2]
+        ], dtype="double")
+        
+        # Camera parameters
+        center = (img_width/2, img_height/2)
+        focal_length = center[0] / np.tan(60/2 * np.pi / 180)
+        camera_matrix = np.array([
+            [focal_length, 0, center[0]],
+            [0, focal_length, center[1]],
+            [0, 0, 1]
+        ], dtype="double")
+        
+        dist_coeffs = np.zeros((4,1))
+        
+        # Solve PnP
+        try:
+            success, rotation_vector, translation_vector = cv2.solvePnP(
+                model_points, image_points, camera_matrix, dist_coeffs
+            )
+            
+            if success:
+                # Convert rotation vector to rotation matrix
+                rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+                
+                # Calculate Euler angles
+                sy = np.sqrt(rotation_matrix[0,0] * rotation_matrix[0,0] + rotation_matrix[1,0] * rotation_matrix[1,0])
+                singular = sy < 1e-6
+                
+                if not singular:
+                    x = np.arctan2(rotation_matrix[2,1], rotation_matrix[2,2])
+                    y = np.arctan2(-rotation_matrix[2,0], sy)
+                    z = np.arctan2(rotation_matrix[1,0], rotation_matrix[0,0])
+                else:
+                    x = np.arctan2(-rotation_matrix[1,2], rotation_matrix[1,1])
+                    y = np.arctan2(-rotation_matrix[2,0], sy)
+                    z = 0
+                
+                # Convert to degrees
+                pitch = np.degrees(x)
+                yaw = np.degrees(y)
+                roll = np.degrees(z)
+                
+                return pitch, yaw, roll
+        except:
+            pass
+        
+        return 0.0, 0.0, 0.0  # Default values if estimation fails
+    
+    def extract_features(self, ear_left, ear_right, mar, head_pose):
+        """Extract comprehensive features for ML classification"""
+        features = []
+        
+        # Eye features
+        features.extend([ear_left, ear_right, (ear_left + ear_right) / 2])
+        
+        # Mouth features
+        features.append(mar)
+        
+        # Head pose features
+        features.extend(head_pose)
+        
+        # Blink rate (blinks per minute)
+        current_time = time.time()
+        time_diff = current_time - self.start_time
+        blink_rate = (self.blink_counter / max(time_diff, 1)) * 60
+        features.append(blink_rate)
+        
+        # Historical features
+        if len(self.ear_history) > 10:
+            features.extend([
+                np.mean(list(self.ear_history)[-10:]),
+                np.std(list(self.ear_history)[-10:]),
+                np.mean(list(self.mar_history)[-10:]),
+                np.std(list(self.mar_history)[-10:])
+            ])
+        else:
+            features.extend([0.3, 0.1, 0.3, 0.1])  # Default values
+        
+        # Eye closure duration
+        if self.eye_counter > 0:
+            closure_duration = self.eye_counter / 30.0  # Assuming 30 FPS
+            features.append(closure_duration)
+        else:
+            features.append(0.0)
+        
+        return np.array(features).reshape(1, -1)
+    
+    def classify_consciousness_state(self, features):
+        """FIXED: More responsive consciousness state classification"""
+        ear_avg = features[0][2]  # Average EAR
+        mar = features[0][3]      # MAR
+        head_pose = features[0][4:7]  # Pitch, Yaw, Roll
+        blink_rate = features[0][7]
+        closure_duration = features[0][-1]
+        
+        # Start with high consciousness score
+        consciousness_score = 1.0
+        state = "CONSCIOUS"
+        
+        # FIXED: More lenient eye-based indicators
+        if ear_avg < self.EYE_AR_THRESH:
+            # Only penalize if eyes are closed for extended period
+            if closure_duration > 1.0:  # More than 1 second
+                consciousness_score -= 0.2
+            if closure_duration > self.MICROSLEEP_THRESH:
+                consciousness_score -= 0.3
+                state = "MICROSLEEP"
+        else:
+            # Eyes are open - reset penalties and boost score
+            consciousness_score = min(1.0, consciousness_score + 0.1)
+        
+        # FIXED: More reasonable blink rate analysis
+        if blink_rate < 3:  # Very low blink rate (more lenient)
+            consciousness_score -= 0.1
+        elif blink_rate > 40:  # Very high blink rate (more lenient)
+            consciousness_score -= 0.15
+        
+        # FIXED: Yawn detection with higher threshold
+        if mar > self.MOUTH_AR_THRESH and self.yawn_counter > self.YAWN_CONSEC_FRAMES:
+            consciousness_score -= 0.1  # Reduced penalty
+        
+        # FIXED: More lenient head pose analysis
+        pitch, yaw, roll = head_pose
+        if abs(pitch) > 30 or abs(yaw) > 35 or abs(roll) > 25:  # Increased thresholds
+            consciousness_score -= 0.15  # Reduced penalty
+        
+        # FIXED: Extreme head movements (more lenient)
+        if abs(pitch) > 45:  # Increased threshold
+            consciousness_score -= 0.2  # Reduced penalty
+        
+        # FIXED: More reasonable state determination
+        if consciousness_score > 0.85:
+            state = "CONSCIOUS"
+        elif consciousness_score > 0.7:
+            state = "ALERT_FATIGUE"
+        elif consciousness_score > 0.5:  # Increased threshold
+            state = "DROWSY"
+        elif consciousness_score > 0.3:  # Increased threshold
+            state = "SEVERELY_DROWSY"
+        else:
+            state = "UNCONSCIOUS"
+        
+        # FIXED: Special case for microsleep - more strict conditions
+        if closure_duration > self.MICROSLEEP_THRESH and ear_avg < 0.1:  # Lower EAR threshold
+            state = "MICROSLEEP"
+            consciousness_score = 0.2  # Less severe penalty
+        
+        # BOOST: If eyes are clearly open, ensure conscious state
+        if ear_avg > 0.25:  # Eyes clearly open
+            if state not in ["CONSCIOUS", "ALERT_FATIGUE"]:
+                state = "CONSCIOUS"
+                consciousness_score = max(0.8, consciousness_score)
+        
+        return state, max(0.0, min(1.0, consciousness_score))
+    
+    def detect_anomalies(self):
+        """Detect anomalous patterns that might indicate unconsciousness"""
+        if len(self.consciousness_history) < 5:
+            return False
+        
+        recent_states = list(self.consciousness_history)[-5:]
+        unconscious_count = sum(1 for state in recent_states if state in ["UNCONSCIOUS", "SEVERELY_DROWSY", "MICROSLEEP"])
+        
+        return unconscious_count >= 4  # Increased threshold
+    
+    def process_frame(self, frame):
+        """Process a single frame and return driver state"""
+        height, width, _ = frame.shape
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Process with MediaPipe Face Mesh
+        results = self.face_mesh.process(rgb_frame)
+        
+        if not results.multi_face_landmarks:
+            # No face detected - potential emergency
+            self.current_state.consciousness_level = "NO_FACE_DETECTED"
+            self.current_state.confidence = 0.0
+            return self.current_state, frame
+        
+        # Process the first detected face
+        face_landmarks = results.multi_face_landmarks[0]
+        landmarks = face_landmarks.landmark
+        
+        # Calculate eye aspect ratios
+        ear_left = self.calculate_eye_aspect_ratio_mediapipe(landmarks, self.LEFT_EYE_POINTS, width, height)
+        ear_right = self.calculate_eye_aspect_ratio_mediapipe(landmarks, self.RIGHT_EYE_POINTS, width, height)
+        ear_avg = (ear_left + ear_right) / 2.0
+        
+        # Calculate mouth aspect ratio
+        mar = self.calculate_mouth_aspect_ratio_mediapipe(landmarks, self.MOUTH_POINTS, width, height)
+        
+        # Estimate head pose
+        head_pose = self.estimate_head_pose_mediapipe(landmarks, width, height)
+        
+        # Update histories
+        self.ear_history.append(ear_avg)
+        self.mar_history.append(mar)
+        self.head_pose_history.append(head_pose)
+        
+        # FIXED: Better blink and yawn detection
+        if ear_avg < self.EYE_AR_THRESH:
+            self.eye_counter += 1
+            if self.eyes_closed_start is None:
+                self.eyes_closed_start = time.time()
+        else:
+            if self.eye_counter >= self.EYE_AR_CONSEC_FRAMES:
+                self.blink_counter += 1
+            self.eye_counter = 0
+            self.eyes_closed_start = None
+        
+        yawn_detected = False
+        if mar > self.MOUTH_AR_THRESH:
+            self.yawn_counter += 1
+            if self.yawn_counter >= self.YAWN_CONSEC_FRAMES:
+                yawn_detected = True
+        else:
+            self.yawn_counter = 0
+        
+        # Extract features and classify
+        features = self.extract_features(ear_left, ear_right, mar, head_pose)
+        consciousness_state, confidence = self.classify_consciousness_state(features)
+        
+        # Update consciousness history
+        self.consciousness_history.append(consciousness_state)
+        
+        # FIXED: Better microsleep detection
+        current_time = time.time()
+        if self.eyes_closed_start:
+            eyes_closed_duration = current_time - self.eyes_closed_start
+            microsleep_detected = eyes_closed_duration > self.MICROSLEEP_THRESH
+        else:
+            microsleep_detected = False
+        
+        # Calculate blink rate
+        time_diff = current_time - self.start_time
+        blink_rate = (self.blink_counter / max(time_diff, 1)) * 60
+        
+        # Update current state
+        self.current_state = DriverState(
+            consciousness_level=consciousness_state,
+            confidence=confidence,
+            eye_aspect_ratio=ear_avg,
+            mouth_aspect_ratio=mar,
+            head_pose=head_pose,
+            blink_rate=blink_rate,
+            yawn_detected=yawn_detected,
+            microsleep_detected=microsleep_detected,
+            timestamp=datetime.now()
+        )
+        
+        # Draw annotations on frame
+        annotated_frame = self.draw_annotations(frame, face_landmarks, self.current_state, width, height)
+        
+        return self.current_state, annotated_frame
+    
+    def draw_annotations(self, frame, face_landmarks, state, width, height):
+        """Draw visual annotations on the frame"""
+        # Draw face mesh landmarks
+        self.mp_drawing.draw_landmarks(
+            frame,
+            face_landmarks,
+            self.mp_face_mesh.FACEMESH_CONTOURS,
+            None,
+            self.mp_drawing_styles.get_default_face_mesh_contours_style()
+        )
+        
+        # Draw eye landmarks
+        for point_idx in self.LEFT_EYE_POINTS + self.RIGHT_EYE_POINTS:
+            if point_idx < len(face_landmarks.landmark):
+                x = int(face_landmarks.landmark[point_idx].x * width)
+                y = int(face_landmarks.landmark[point_idx].y * height)
+                cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
+        
+        # Draw mouth landmarks
+        for point_idx in self.MOUTH_POINTS:
+            if point_idx < len(face_landmarks.landmark):
+                x = int(face_landmarks.landmark[point_idx].x * width)
+                y = int(face_landmarks.landmark[point_idx].y * height)
+                cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)
+        
+        # Status display
+        status_color = self.get_status_color(state.consciousness_level)
+        
+        # Display information
+        info_text = [
+            f"State: {state.consciousness_level}",
+            f"Confidence: {state.confidence:.2f}",
+            f"EAR: {state.eye_aspect_ratio:.3f}",
+            f"MAR: {state.mouth_aspect_ratio:.3f}",
+            f"Blink Rate: {state.blink_rate:.1f}/min",
+            f"Head Pose: P:{state.head_pose[0]:.1f} Y:{state.head_pose[1]:.1f} R:{state.head_pose[2]:.1f}"
+        ]
+        
+        # Draw background rectangle
+        cv2.rectangle(frame, (10, 10), (450, 200), (0, 0, 0), -1)
+        cv2.rectangle(frame, (10, 10), (450, 200), status_color, 3)
+        
+        # Draw text
+        for i, text in enumerate(info_text):
+            y_pos = 35 + i * 25
+            cv2.putText(frame, text, (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Warning indicators
+        if state.yawn_detected:
+            cv2.putText(frame, "YAWN DETECTED!", (20, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        if state.microsleep_detected:
+            cv2.putText(frame, "MICROSLEEP ALERT!", (20, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Add MediaPipe attribution
+        cv2.putText(frame, "Powered by MediaPipe", (width-200, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
+        
+        return frame
+    
+    def get_status_color(self, state):
+        """Get color based on consciousness state"""
+        color_map = {
+            "CONSCIOUS": (0, 255, 0),           # Green
+            "ALERT_FATIGUE": (0, 255, 255),    # Yellow
+            "DROWSY": (0, 165, 255),           # Orange
+            "SEVERELY_DROWSY": (0, 0, 255),    # Red
+            "UNCONSCIOUS": (0, 0, 139),        # Dark Red
+            "MICROSLEEP": (128, 0, 128),       # Purple
+            "NO_FACE_DETECTED": (255, 255, 255) # White
+        }
+        return color_map.get(state, (255, 255, 255))
+    
+    def run(self):
+        """Main execution loop"""
+        print("\n🚗 Starting Driver Monitoring System...")
+        print("📹 Camera initialized with MediaPipe")
+        print("⌨️  Controls:")
+        print("   - Press 'q' to quit")
+        print("   - Press 's' to save current state")
+        print("   - Press 'r' to reset counters")
+        print("🔴 Monitoring started...\n")
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                print("❌ Failed to capture frame")
+                break
+            
+            # Process frame
+            state, annotated_frame = self.process_frame(frame)
+            
+            # Check for emergency conditions
+            if state.consciousness_level in ["UNCONSCIOUS", "SEVERELY_DROWSY", "MICROSLEEP"]:
+                self.trigger_emergency_alert(state)
+            
+            # Display frame
+            cv2.imshow('🚗 Smart Driver Monitoring System', annotated_frame)
+            
+            # Handle key presses
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                self.save_state_log(state)
+            elif key == ord('r'):
+                self.reset_counters()
+            
+            self.frame_counter += 1
+        
+        self.cleanup()
+    
+    def reset_counters(self):
+        """Reset all counters and histories"""
+        self.eye_counter = 0
+        self.yawn_counter = 0
+        self.blink_counter = 0
+        self.frame_counter = 0
+        self.start_time = time.time()
+        self.eyes_closed_start = None
+        self.ear_history.clear()
+        self.mar_history.clear()
+        self.head_pose_history.clear()
+        self.consciousness_history.clear()
+        print("🔄 Counters and histories reset")
+    
+    def trigger_emergency_alert(self, state):
+        current_time = time.time()
+
+         # Check if enough time has passed since last alert
+        if (current_time - self.last_alert_time) < self.ALERT_COOLDOWN:
+        # Still in cooldown period, skip alert
+            return
+           # Update last alert time
+        self.last_alert_time = current_time
+        """Trigger emergency alert for critical states"""
+        alert_data = {
+            'timestamp': state.timestamp.isoformat(),
+            'state': state.consciousness_level,
+            'confidence': state.confidence,
+            'location': 'GPS_COORDINATES_HERE',  # Integrate with GPS
+            'vehicle_id': 'VEHICLE_ID_HERE'
+        }
+        
+        # Log critical event
+        self.logger.critical(f"🚨 EMERGENCY ALERT: Driver {state.consciousness_level} - Confidence: {state.confidence:.2f}")
+        
+        # Here you would integrate with:
+        # - Android app notification
+        # - V2V communication
+        # - Emergency services
+        # - Autonomous takeover system
+        
+        print(f"\n🚨 EMERGENCY ALERT 🚨")
+        print(f"Driver State: {state.consciousness_level}")
+        print(f"Confidence: {state.confidence:.2f}")
+        print(f"Timestamp: {state.timestamp}")
+        print("🤖 Initiating emergency protocols...")
+        print("📱 Notifying Android app...")
+        print("🚗 Preparing autonomous takeover...")
+        print("📡 Broadcasting V2V alert...\n")
+    
+    def save_state_log(self, state):
+        """Save current state to log file"""
+        log_data = {
+            'timestamp': state.timestamp.isoformat(),
+            'consciousness_level': state.consciousness_level,
+            'confidence': state.confidence,
+            'eye_aspect_ratio': state.eye_aspect_ratio,
+            'mouth_aspect_ratio': state.mouth_aspect_ratio,
+            'head_pose': state.head_pose,
+            'blink_rate': state.blink_rate,
+            'yawn_detected': state.yawn_detected,
+            'microsleep_detected': state.microsleep_detected
+        }
+        
+        filename = f"driver_state_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(filename, 'w') as f:
+            json.dump(log_data, f, indent=2)
+        
+        print(f"💾 State saved to {filename}")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.cap.release()
+        cv2.destroyAllWindows()
+        print("🛑 Driver Monitoring System terminated")
+        print("👋 Thank you for using Smart Driver Monitoring!")
+
+def main():
+    """Main function to run the driver monitoring system"""
+    try:
+        print("🚀 Initializing Smart Driver Monitoring System...")
+        print("📦 Using MediaPipe - No external files needed!")
+        
+        # Initialize the system
+        dms = DriverMonitoringSystem(camera_id=0)
+        
+        # Run the monitoring system
+        dms = DriverMonitoringSystem(camera_id=0)
+        
+        # Run the monitoring system
+        dms.run()
+        
+    except Exception as e:
+        print(f"❌ An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
